@@ -10,7 +10,7 @@ Lightweight and reliable daily dictation tool for Windows.
 
 - Super simple: press hotkey, speak, release, text appears.
 - Super fast: local Whisper transcription with no cloud round-trip.
-- No deployment for end users: download one EXE from GitHub Releases and run.
+- No installation for end users: download a ZIP from GitHub Releases, extract it, and run.
 - Works in any PC app that accepts paste/input.
 
 ## What It Does
@@ -117,13 +117,35 @@ Important:
 - Start LocalSTT.exe specifically from the dist/LocalSTT folder
 - Do not move only the EXE file by itself; the full dist/LocalSTT folder is required
 
+## Recommended Release Package (ZIP)
+
+Build the recommended end-user ZIP package:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_release_zip.ps1
+```
+
+Output:
+- dist/LocalSTT-Portable.zip
+
+Recommended end-user flow:
+1. Download `LocalSTT-Portable.zip` from GitHub Releases.
+2. Extract the ZIP to any folder.
+3. Open the extracted `LocalSTT` folder.
+4. Run `LocalSTT.exe`.
+
+Why ZIP is recommended:
+- Faster startup than the one-file EXE.
+- Fewer antivirus false positives.
+- No installation required.
+
 The legacy-compatible script also works:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_exe.ps1
 ```
 
-## One-File EXE Build (No Repo Needed for End Users)
+## Optional One-File EXE Build
 
 Build a single executable file:
 
@@ -134,10 +156,12 @@ powershell -ExecutionPolicy Bypass -File scripts/build_onefile.ps1
 Output:
 - dist/LocalSTT-OneFile.exe
 
-For public release on GitHub:
-- Upload `LocalSTT-OneFile.exe` to Releases.
-- End users can download only this one EXE file.
-- End users do not need to clone or download the repository.
+Use this variant only if you specifically want a single downloadable file.
+
+Tradeoffs:
+- Simpler to distribute as one file.
+- Slower startup because it unpacks at launch.
+- More likely to trigger antivirus false positives than the ZIP portable folder.
 
 ## Models
 
