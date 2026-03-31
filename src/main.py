@@ -1,4 +1,3 @@
-import ctypes
 import json
 import logging
 import os
@@ -6,8 +5,6 @@ import queue
 import sys
 import threading
 import time
-import wave
-from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,11 +12,90 @@ from typing import Any
 
 import numpy as np
 import pyautogui
-import pyperclip
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from pynput import keyboard
-from pynput.keyboard import Controller, Key
+from pynput.keyboard import Controller
+
+from app_core import LocalSTTCore
+
+
+CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
+SHIFT_KEYS = {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}
+COMMON_LANGUAGE_OPTIONS: list[tuple[str, str]] = [
+    ("Auto detect", "auto"),
+    ("English (en)", "en"),
+    ("Russian (ru)", "ru"),
+    ("Spanish (es)", "es"),
+    ("German (de)", "de"),
+    ("French (fr)", "fr"),
+    ("Italian (it)", "it"),
+    ("Portuguese (pt)", "pt"),
+    ("Ukrainian (uk)", "uk"),
+    ("Polish (pl)", "pl"),
+    ("Turkish (tr)", "tr"),
+    ("Japanese (ja)", "ja"),
+    ("Korean (ko)", "ko"),
+    ("Chinese (zh)", "zh"),
+]
+LANGUAGE_LABEL_TO_CODE = {label: code for label, code in COMMON_LANGUAGE_OPTIONS}
+LANGUAGE_CODE_TO_LABEL = {code: label for label, code in COMMON_LANGUAGE_OPTIONS}
+COMMON_TRANSCRIPTION_MODE_OPTIONS: list[tuple[str, str]] = [
+    ("Full file after stop (stable)", "full-file"),
+    ("Live overlap during recording (experimental)", "live-overlap"),
+]
+TRANSCRIPTION_MODE_LABEL_TO_CODE = {label: code for label, code in COMMON_TRANSCRIPTION_MODE_OPTIONS}
+TRANSCRIPTION_HISTORY_LIMIT = 10
+SUPPORTED_LANGUAGE_CODES = {
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv",
+    "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
+    "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr",
+    "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
+    "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu",
+    "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl",
+    "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su",
+}
+
+
+def _normalize_transcription_language(value: Any, fallback: str = "auto") -> str:
+    if value is None:
+        return fallback
+
+    raw = str(value).strip()
+    if not raw:
+        return fallback
+    if raw in LANGUAGE_LABEL_TO_CODE:
+        return LANGUAGE_LABEL_TO_CODE[raw]
+
+    cleaned = raw.lower()
+    if cleaned in {"auto", "auto detect", "detect"}:
+        return "auto"
+    if cleaned in SUPPORTED_LANGUAGE_CODES:
+        return cleaned
+    return fallback
+
+
+def _language_display_value(language_code: str) -> str:
+    normalized = _normalize_transcription_language(language_code)
+    return LANGUAGE_CODE_TO_LABEL.get(normalized, normalized)
+
+
+def _normalize_transcription_mode(value: Any, fallback: str = "full-file") -> str:
+    if value is None:
+        return fallback
+
+    raw = str(value).strip()
+    if not raw:
+        return fallback
+    if raw in TRANSCRIPTION_MODE_LABEL_TO_CODE:
+        return TRANSCRIPTION_MODE_LABEL_TO_CODE[raw]
+
+    cleaned = raw.lower()
+    if cleaned in {"full", "full-file", "full_file", "stable", "single", "single-file"}:
+        return "full-file"
+    if cleaned in {"live", "live-overlap", "live_overlap", "stream", "semi-stream", "semi-streaming"}:
+        return "live-overlap"
+    return fallback
 
 
 @dataclass
@@ -38,6 +114,10 @@ class AppConfig:
     restore_clipboard: bool = True
     input_device: str | None = None
     popup_duration_sec: float = 1.2
+    transcription_mode: str = "full-file"
+    chunk_duration_sec: float = 2.0
+    chunk_overlap_sec: float = 0.5
+    transcription_language: str = "auto"
 
 
 class QueueLogHandler(logging.Handler):
@@ -52,23 +132,7 @@ class QueueLogHandler(logging.Handler):
             pass
 
 
-def _to_int_if_numeric(value):
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return value
-
-
-def _normalize_device_name(name: str) -> str:
-    cleaned = (name or "").strip()
-    marker = " (@"
-    pos = cleaned.find(marker)
-    if pos > 0:
-        cleaned = cleaned[:pos].strip()
-    cleaned = " ".join(cleaned.split())
-    return cleaned
-
-
-class LocalSTTApp:
+class LocalSTTApp(LocalSTTCore):
     def __init__(self, config: AppConfig) -> None:
         self.config = config
 
@@ -81,6 +145,7 @@ class LocalSTTApp:
         self.recordings_dir = local_app_data / "recordings"
         self.logs_dir = local_app_data / "logs"
         self.settings_file = local_app_data / "settings.json"
+        self.history_file = local_app_data / "history.json"
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -97,13 +162,36 @@ class LocalSTTApp:
         self.audio_queue: queue.Queue[np.ndarray] = queue.Queue()
         self.popup_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self.stream: sd.InputStream | None = None
+        self.current_recording_sample_rate: int = self.config.sample_rate
         self.mic_monitor_stream: sd.InputStream | None = None
         self.mic_level: float = 0.0
 
         self.last_audio_file: Path | None = None
         self.keyboard_controller = Controller()
         self.target_hwnd: int | None = None
+        self.target_focus_hwnd: int | None = None
         self.action_lock = threading.Lock()
+        self.recording_started_at: float | None = None
+        self.transcription_cancel_event = threading.Event()
+        self.last_pasted_text: str | None = None
+        self.last_paste_target_hwnd: int | None = None
+        self.last_paste_target_focus_hwnd: int | None = None
+        self.last_paste_can_undo = False
+        self.hotkey_ctrl_pressed = False
+        self.hotkey_shift_pressed = False
+        self.active_hotkey_names: set[str] = set()
+        self.recording_audio_lock = threading.Lock()
+        self.recording_audio_event = threading.Event()
+        self.recording_audio_bytes = bytearray()
+        self.recording_audio_frame_count = 0
+        self.live_transcription_thread = None
+        self.live_transcription_text = ""
+        self.live_transcription_chunk_count = 0
+        self.live_transcription_language_scores: dict[str, float] = {}
+        self.live_transcription_error = None
+        self.live_transcription_cancelled = False
+        self.live_mode_session = None
+        self.transcription_history: list[dict[str, Any]] = []
 
         self.ui_root = None
         self.ui_log_text = None
@@ -114,12 +202,19 @@ class LocalSTTApp:
         self.ui_mic_test_btn = None
         self.ui_vad_var = None
         self.ui_restore_clipboard_var = None
+        self.ui_language_var = None
+        self.ui_language_combo = None
         self.ui_status_var = None
         self.ui_toast_window = None
         self.ui_toast_label = None
         self.ui_toast_timer_id = None
+        self.ui_cancel_transcription_btn = None
+        self.ui_repeat_paste_btn = None
+        self.ui_undo_paste_btn = None
+        self.ui_history_text = None
 
         self._load_settings_from_file()
+        self._load_history_from_file()
 
         model_source, local_files_only = self._resolve_model_source()
         if self.config.offline_only:
@@ -137,50 +232,98 @@ class LocalSTTApp:
         self.input_device = self._resolve_input_device(self.config.input_device)
         self._log_audio_input_info()
 
-        self.hotkeys = keyboard.GlobalHotKeys(
-            {
-                "<ctrl>+<shift>+q": lambda: self._dispatch_hotkey("toggle_recording", self.toggle_recording),
-                "<ctrl>+<shift>+w": lambda: self._dispatch_hotkey("transcribe_last", self.transcribe_last_file),
-                "<ctrl>+<shift>+e": lambda: self._dispatch_hotkey("shutdown", self.shutdown),
-            }
+        self.hotkey_actions_by_vk: dict[int, tuple[str, Any]] = {
+            0x51: ("toggle_recording", self.toggle_recording),
+            0x57: ("transcribe_last", self.transcribe_last_file),
+            0x45: ("shutdown", self.shutdown),
+        }
+        self.hotkey_actions_by_char: dict[str, tuple[str, Any]] = {
+            "q": ("toggle_recording", self.toggle_recording),
+            "w": ("transcribe_last", self.transcribe_last_file),
+            "e": ("shutdown", self.shutdown),
+            "й": ("toggle_recording", self.toggle_recording),
+            "ц": ("transcribe_last", self.transcribe_last_file),
+            "у": ("shutdown", self.shutdown),
+        }
+
+        self.hotkeys = keyboard.Listener(
+            on_press=self._on_hotkey_press,
+            on_release=self._on_hotkey_release,
         )
 
-    def _runtime_roots(self) -> list[Path]:
-        roots: list[Path] = []
-        if getattr(sys, "frozen", False):
-            meipass = getattr(sys, "_MEIPASS", None)
-            if meipass:
-                roots.append(Path(meipass))
-            roots.append(self.project_root / "_internal")
-        roots.append(self.project_root)
-        return roots
+    def _key_vk(self, key) -> int | None:
+        try:
+            vk = getattr(key, "vk", None)
+            if vk is None:
+                return None
+            return int(vk)
+        except Exception:
+            return None
 
-    def _resolve_existing_path(self, relative_path: str) -> Path | None:
-        rel = Path(relative_path)
-        for root in self._runtime_roots():
-            candidate = root / rel
-            if candidate.exists():
-                return candidate
+    def _key_char(self, key) -> str | None:
+        try:
+            char = getattr(key, "char", None)
+            if char is None:
+                return None
+            return str(char).lower()
+        except Exception:
+            return None
+
+    def _resolve_hotkey_action(self, key) -> tuple[str, Any] | None:
+        vk = self._key_vk(key)
+        if vk is not None and vk in self.hotkey_actions_by_vk:
+            return self.hotkey_actions_by_vk[vk]
+
+        char = self._key_char(key)
+        if char is not None and char in self.hotkey_actions_by_char:
+            return self.hotkey_actions_by_char[char]
+
         return None
 
-    def _resolve_model_source(self):
-        model_path = Path(self.config.model_path)
-        if not model_path.is_absolute():
-            found = self._resolve_existing_path(str(model_path))
-            if found is not None:
-                model_path = found
-            else:
-                model_path = self.project_root / model_path
+    def _on_hotkey_press(self, key) -> None:
+        try:
+            if key in CTRL_KEYS:
+                self.hotkey_ctrl_pressed = True
+                return
+            if key in SHIFT_KEYS:
+                self.hotkey_shift_pressed = True
+                return
 
-        if model_path.exists():
-            return str(model_path), True
+            if not (self.hotkey_ctrl_pressed and self.hotkey_shift_pressed):
+                return
 
-        if self.config.offline_only:
-            raise FileNotFoundError(
-                f"Offline model not found at '{model_path}'. Download model once before startup."
-            )
+            resolved = self._resolve_hotkey_action(key)
+            if resolved is None:
+                return
 
-        return self.config.model_size, False
+            hotkey_name, action = resolved
+            if hotkey_name in self.active_hotkey_names:
+                return
+
+            self.active_hotkey_names.add(hotkey_name)
+            self._dispatch_hotkey(hotkey_name, action)
+        except Exception:
+            logging.exception("Hotkey press handler failed")
+
+    def _on_hotkey_release(self, key) -> None:
+        try:
+            if key in CTRL_KEYS:
+                self.hotkey_ctrl_pressed = False
+                self.active_hotkey_names.clear()
+                return
+            if key in SHIFT_KEYS:
+                self.hotkey_shift_pressed = False
+                self.active_hotkey_names.clear()
+                return
+
+            resolved = self._resolve_hotkey_action(key)
+            if resolved is None:
+                return
+
+            hotkey_name, _action = resolved
+            self.active_hotkey_names.discard(hotkey_name)
+        except Exception:
+            logging.exception("Hotkey release handler failed")
 
     def _resolve_icon_path(self) -> Path | None:
         candidates = [
@@ -225,6 +368,14 @@ class LocalSTTApp:
             self.config.restore_clipboard = bool(data.get("restore_clipboard", self.config.restore_clipboard))
             self.config.model_size = str(data.get("model_size", self.config.model_size))
             self.config.model_path = str(data.get("model_path", self.config.model_path))
+            self.config.transcription_mode = _normalize_transcription_mode(
+                data.get("transcription_mode", self.config.transcription_mode),
+                fallback=self.config.transcription_mode,
+            )
+            self.config.transcription_language = _normalize_transcription_language(
+                data.get("transcription_language", self.config.transcription_language),
+                fallback=self.config.transcription_language,
+            )
         except Exception:
             logging.exception("Failed to load settings")
 
@@ -236,11 +387,101 @@ class LocalSTTApp:
                 "restore_clipboard": self.config.restore_clipboard,
                 "model_size": self.config.model_size,
                 "model_path": self.config.model_path,
+                "transcription_mode": self.config.transcription_mode,
+                "transcription_language": self.config.transcription_language,
             }
             with self.settings_file.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception:
             logging.exception("Failed to save settings")
+
+    def _load_history_from_file(self) -> None:
+        try:
+            if not self.history_file.exists():
+                self.transcription_history = []
+                return
+            with self.history_file.open("r", encoding="utf-8") as f:
+                raw_history = json.load(f)
+
+            if not isinstance(raw_history, list):
+                self.transcription_history = []
+                return
+
+            history: list[dict[str, Any]] = []
+            for raw_entry in raw_history[:TRANSCRIPTION_HISTORY_LIMIT]:
+                if not isinstance(raw_entry, dict):
+                    continue
+                text = str(raw_entry.get("text", "")).strip()
+                if not text:
+                    continue
+                history.append(
+                    {
+                        "created_at": str(raw_entry.get("created_at", "")),
+                        "text": text,
+                        "char_count": int(raw_entry.get("char_count", len(text)) or len(text)),
+                        "language": str(raw_entry.get("language", "unknown") or "unknown"),
+                        "mode": str(raw_entry.get("mode", "full-file") or "full-file"),
+                    }
+                )
+            self.transcription_history = history
+        except Exception:
+            logging.exception("Failed to load transcription history")
+            self.transcription_history = []
+
+    def _save_history_to_file(self) -> None:
+        try:
+            with self.history_file.open("w", encoding="utf-8") as f:
+                json.dump(self.transcription_history[:TRANSCRIPTION_HISTORY_LIMIT], f, ensure_ascii=False, indent=2)
+        except Exception:
+            logging.exception("Failed to save transcription history")
+
+    def _remember_transcription_result(self, *, text: str, language: str, mode: str) -> None:
+        cleaned_text = str(text).strip()
+        if not cleaned_text:
+            return
+
+        entry = {
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "text": cleaned_text,
+            "char_count": len(cleaned_text),
+            "language": str(language or "unknown"),
+            "mode": str(mode or "full-file"),
+        }
+        self.transcription_history = [entry] + self.transcription_history[: TRANSCRIPTION_HISTORY_LIMIT - 1]
+        self._save_history_to_file()
+        if self.ui_root is not None:
+            try:
+                self.ui_root.after(0, self._refresh_history_view)
+            except Exception:
+                logging.exception("Failed to schedule history refresh")
+
+    def _refresh_history_view(self) -> None:
+        if self.ui_history_text is None:
+            return
+        self.ui_history_text.configure(state="normal")
+        self.ui_history_text.delete("1.0", "end")
+
+        if not self.transcription_history:
+            self.ui_history_text.insert("1.0", "No recent transcriptions yet.")
+            self.ui_history_text.configure(state="disabled")
+            return
+
+        history_count = len(self.transcription_history)
+        for idx, entry in enumerate(self.transcription_history, start=1):
+            header = (
+                f"#{idx}  {entry.get('created_at', '')}\n"
+                f"Chars: {entry.get('char_count', 0)} | "
+                f"Language: {entry.get('language', 'unknown')} | "
+                f"Mode: {entry.get('mode', 'full-file')}\n\n"
+            )
+            self.ui_history_text.insert("end", header)
+            self.ui_history_text.insert("end", entry.get("text", ""))
+            if idx < history_count:
+                self.ui_history_text.insert("end", "\n" + ("-" * 28) + "\n\n")
+            else:
+                self.ui_history_text.insert("end", "\n")
+
+        self.ui_history_text.configure(state="disabled")
 
     def _dispatch_hotkey(self, hotkey_name: str, action) -> None:
         logging.info("Hotkey pressed: %s", hotkey_name)
@@ -254,435 +495,38 @@ class LocalSTTApp:
 
         threading.Thread(target=_runner, daemon=True).start()
 
-    def _audio_callback(self, indata: np.ndarray, frames: int, callback_time, status) -> None:
-        if status:
-            logging.warning("Audio status: %s", status)
-        self.audio_queue.put(indata.copy())
+    def _dispatch_ui_action(self, action_name: str, action) -> None:
+        logging.info("UI action triggered: %s", action_name)
 
-    def _resolve_input_device(self, input_device: str | None):
-        if input_device is None or input_device.strip() == "":
-            return None
-        return _to_int_if_numeric(input_device.strip())
-
-    def _input_devices_list(self) -> list[tuple[int, str]]:
-        result: list[tuple[int, str]] = []
-        try:
-            for idx, dev in enumerate(sd.query_devices()):
-                if int(dev.get("max_input_channels", 0)) > 0:
-                    raw_name = str(dev.get("name", f"Input {idx}"))
-                    hostapi_index = int(dev.get("hostapi", -1))
-                    hostapi_name = ""
-                    if hostapi_index >= 0:
-                        try:
-                            hostapi_name = str(sd.query_hostapis(hostapi_index).get("name", "")).strip()
-                        except Exception:
-                            hostapi_name = ""
-
-                    display_name = _normalize_device_name(raw_name)
-                    if hostapi_name:
-                        display_name = f"{display_name} [{hostapi_name}]"
-
-                    result.append((idx, display_name))
-        except Exception:
-            logging.exception("Failed to enumerate input devices")
-        return result
-
-    def _find_first_input_device(self):
-        for idx, _name in self._input_devices_list():
-            return idx
-        return None
-
-    def _has_any_input_device(self) -> bool:
-        return len(self._input_devices_list()) > 0
-
-    def _get_effective_input_device(self):
-        if self.input_device is not None:
-            return self.input_device
-        try:
-            default_in, _ = sd.default.device
-            if isinstance(default_in, int) and default_in >= 0:
-                return default_in
-        except Exception:
-            logging.exception("Could not read default audio device")
-        return self._find_first_input_device()
-
-    def _iter_input_device_candidates(self):
-        seen = set()
-        preferred = self._get_effective_input_device()
-        if preferred is not None:
-            preferred = _to_int_if_numeric(preferred)
-            if preferred not in seen:
-                seen.add(preferred)
-                yield preferred
-        for idx, _name in self._input_devices_list():
-            if idx not in seen:
-                seen.add(idx)
-                yield idx
-
-    def _sample_rate_candidates(self, device):
-        candidates = [int(self.config.sample_rate)]
-        try:
-            info = sd.query_devices(device, "input")
-            default_sr = int(float(info.get("default_samplerate", 0) or 0))
-            if default_sr > 0 and default_sr not in candidates:
-                candidates.append(default_sr)
-        except Exception:
-            logging.exception("Could not query sample rate for device %s", device)
-
-        for sr in [16000, 48000, 44100, 8000]:
-            if sr not in candidates:
-                candidates.append(sr)
-        return candidates
-
-    def _open_input_stream_with_fallback(self):
-        last_error = None
-        for device in self._iter_input_device_candidates():
-            for rate in self._sample_rate_candidates(device):
-                try:
-                    sd.check_input_settings(
-                        device=device,
-                        channels=self.config.channels,
-                        dtype=self.config.dtype,
-                        samplerate=rate,
-                    )
-                    stream = sd.InputStream(
-                        samplerate=rate,
-                        channels=self.config.channels,
-                        dtype=self.config.dtype,
-                        device=device,
-                        callback=self._audio_callback,
-                    )
-                    stream.start()
-                    return stream, device, rate
-                except Exception as exc:
-                    last_error = exc
-                    logging.warning("Input probe failed: device=%s samplerate=%s error=%s", device, rate, exc)
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("No input devices available")
-
-    def _log_audio_input_info(self) -> None:
-        try:
-            effective = self._get_effective_input_device()
-            if effective is None:
-                logging.error("No input microphone device found")
-                return
-            info = sd.query_devices(effective, "input")
-            logging.info("Using microphone: %s", info.get("name", effective))
-        except Exception:
-            logging.exception("Could not resolve input device")
-
-    def _release_modifiers(self) -> None:
-        for key in [Key.ctrl, Key.shift, Key.alt, Key.cmd]:
+        def _runner() -> None:
             try:
-                self.keyboard_controller.release(key)
+                with self.action_lock:
+                    action()
             except Exception:
-                pass
-        for key_name in ["ctrl", "shift", "alt", "winleft", "winright"]:
-            try:
-                pyautogui.keyUp(key_name)
-            except Exception:
-                pass
+                logging.exception("UI action failed: %s", action_name)
 
-    def _drain_audio_queue(self) -> None:
-        while not self.audio_queue.empty():
-            self.audio_chunks.append(self.audio_queue.get_nowait())
+        threading.Thread(target=_runner, daemon=True).start()
 
-    def _get_foreground_window(self) -> int | None:
-        try:
-            hwnd = int(ctypes.windll.user32.GetForegroundWindow())
-            return hwnd if hwnd != 0 else None
-        except Exception:
-            return None
+    def _update_recovery_buttons(self) -> None:
+        allow_recovery_actions = (not self.is_transcribing) and (not self.is_recording)
 
-    def _get_window_title(self, hwnd: int | None) -> str:
-        if hwnd is None:
-            return ""
-        try:
-            user32 = ctypes.windll.user32
-            length = int(user32.GetWindowTextLengthW(hwnd))
-            if length <= 0:
-                return ""
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            return buf.value
-        except Exception:
-            return ""
-
-    def _get_window_class(self, hwnd: int | None) -> str:
-        if hwnd is None:
-            return ""
-        try:
-            buf = ctypes.create_unicode_buffer(256)
-            ctypes.windll.user32.GetClassNameW(hwnd, buf, 255)
-            return buf.value
-        except Exception:
-            return ""
-
-    def _get_window_pid(self, hwnd: int | None) -> int | None:
-        if hwnd is None:
-            return None
-        try:
-            pid = wintypes.DWORD(0)
-            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            return int(pid.value)
-        except Exception:
-            return None
-
-    def _describe_window(self, hwnd: int | None) -> str:
-        if hwnd is None:
-            return "hwnd=None"
-        return (
-            f"hwnd={hwnd} pid={self._get_window_pid(hwnd)} "
-            f"class='{self._get_window_class(hwnd)}' title='{self._get_window_title(hwnd)}'"
-        )
-
-    def _capture_target_window(self, reason: str) -> None:
-        hwnd = self._get_foreground_window()
-        if hwnd is None:
-            logging.info("Target capture skipped (%s): no foreground window", reason)
-            return
-        if self._get_window_pid(hwnd) == os.getpid():
-            logging.info("Target capture skipped (%s): foreground is app process", reason)
-            return
-        self.target_hwnd = hwnd
-        logging.info("Target window captured (%s): %s", reason, self._describe_window(hwnd))
-
-    def _activate_window(self, hwnd: int | None) -> None:
-        if hwnd is None:
-            return
-        try:
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            if user32.IsIconic(hwnd):
-                user32.ShowWindow(hwnd, 9)
-
-            current_foreground = user32.GetForegroundWindow()
-            current_thread = user32.GetWindowThreadProcessId(current_foreground, None)
-            target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-            this_thread = kernel32.GetCurrentThreadId()
-
-            attached_current = False
-            attached_target = False
-            try:
-                if current_thread and current_thread != this_thread:
-                    attached_current = bool(user32.AttachThreadInput(this_thread, current_thread, True))
-                if target_thread and target_thread != this_thread:
-                    attached_target = bool(user32.AttachThreadInput(this_thread, target_thread, True))
-
-                user32.BringWindowToTop(hwnd)
-                user32.SetForegroundWindow(hwnd)
-                user32.SetFocus(hwnd)
-                time.sleep(0.06)
-            finally:
-                if attached_current:
-                    user32.AttachThreadInput(this_thread, current_thread, False)
-                if attached_target:
-                    user32.AttachThreadInput(this_thread, target_thread, False)
-        except Exception:
-            logging.warning("Could not activate target window")
-
-    def _send_vk(self, vk: int, key_up: bool = False) -> None:
-        flags = 0x0002 if key_up else 0
-        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
-
-    def _send_shortcut_vk(self, modifier_vk: int, key_vk: int) -> None:
-        self._send_vk(modifier_vk, key_up=False)
-        time.sleep(0.01)
-        self._send_vk(key_vk, key_up=False)
-        time.sleep(0.01)
-        self._send_vk(key_vk, key_up=True)
-        time.sleep(0.01)
-        self._send_vk(modifier_vk, key_up=True)
-
-    def _send_wm_paste(self, hwnd: int | None) -> bool:
-        if hwnd is None:
-            return False
-        try:
-            ctypes.windll.user32.SendMessageW(hwnd, 0x0302, 0, 0)
-            return True
-        except Exception:
-            logging.exception("WM_PASTE failed")
-            return False
-
-    def _generate_audio_path(self) -> Path:
-        return self.recordings_dir / f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-
-    def start_recording(self) -> None:
-        if self.is_recording:
-            return
-        if not self._has_any_input_device():
-            logging.error("No microphone found")
-            self._set_status("Microphone not found")
-            self._show_popup("NO MICROPHONE FOUND", bg="#9a1b1b")
-            return
-
-        self.audio_chunks.clear()
-        self.audio_queue = queue.Queue()
-
-        try:
-            self.stream, chosen_device, chosen_rate = self._open_input_stream_with_fallback()
-            self.is_recording = True
-            logging.info("Recording started (device=%s, samplerate=%s)", chosen_device, chosen_rate)
-            self._set_status("Recording...")
-            self._show_popup("RECORDING...", bg="#9a1b1b", persistent=True)
-        except Exception:
-            logging.exception("Failed to start recording")
-            self._set_status("Microphone open failed")
-            self._show_popup("MICROPHONE OPEN FAILED", bg="#9a1b1b")
-
-    def stop_recording(self) -> None:
-        if not self.is_recording:
-            return
-        assert self.stream is not None
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
-        self.is_recording = False
-
-        self._drain_audio_queue()
-        if not self.audio_chunks:
-            logging.warning("Recording stopped but no audio data was captured")
-            self._set_status("No audio captured")
-            self._show_popup("NO AUDIO CAPTURED", bg="#7d5a11")
-            return
-
-        audio_data = np.concatenate(self.audio_chunks, axis=0)
-        if audio_data.ndim > 1 and audio_data.shape[1] == 1:
-            audio_data = audio_data[:, 0]
-
-        output_path = self._generate_audio_path()
-        with wave.open(str(output_path), "wb") as wav_file:
-            wav_file.setnchannels(self.config.channels)
-            wav_file.setsampwidth(np.dtype(self.config.dtype).itemsize)
-            wav_file.setframerate(self.config.sample_rate)
-            wav_file.writeframes(audio_data.tobytes())
-
-        self.last_audio_file = output_path
-        duration_sec = len(audio_data) / float(self.config.sample_rate)
-        logging.info("Recording saved: %s (%.2f sec)", output_path, duration_sec)
-        self._set_status("Recording stopped")
-        self._show_popup("RECORDING STOPPED", bg="#1e6b2d", persistent=True)
-
-        self.transcribe_file_async(output_path)
-
-    def toggle_recording(self) -> None:
-        try:
-            if self.is_recording:
-                self.stop_recording()
-                return
-            self._capture_target_window("toggle_recording_hotkey_start")
-            self.start_recording()
-        except Exception:
-            logging.exception("Toggle recording failed")
-
-    def transcribe_last_file(self) -> None:
-        try:
-            self._capture_target_window("transcribe_last_hotkey")
-            if self.last_audio_file is None:
-                logging.warning("No previous recording found")
-                self._set_status("No last recording")
-                self._show_popup("NO LAST RECORDING", bg="#7d5a11")
-                return
-            self._set_status("Transcribing...")
-            self._show_popup("TRANSCRIBING LAST FILE...", bg="#0d5f8a")
-            self.transcribe_file_async(self.last_audio_file)
-        except Exception:
-            logging.exception("Transcribe last failed")
-            self._show_popup("TRANSCRIBE ERROR", bg="#9a1b1b")
-
-    def transcribe_file_async(self, audio_path: Path) -> None:
-        if self.is_transcribing:
-            logging.warning("Transcription already in progress")
-            return
-        threading.Thread(target=self._transcribe_and_paste, args=(audio_path,), daemon=True).start()
-
-    def _transcribe_and_paste(self, audio_path: Path) -> None:
-        self.is_transcribing = True
-        start = time.perf_counter()
-        try:
-            segments, info = self.model.transcribe(
-                str(audio_path),
-                beam_size=self.config.beam_size,
-                vad_filter=self.config.vad_filter,
-            )
-            text = "".join(segment.text for segment in segments).strip()
-            elapsed = time.perf_counter() - start
-            logging.info(
-                "Transcription done in %.2f sec | detected language=%s prob=%.3f | chars=%d",
-                elapsed,
-                getattr(info, "language", "unknown"),
-                float(getattr(info, "language_probability", 0.0)),
-                len(text),
-            )
-            if text:
-                self._paste_text(text)
-                logging.info("Text pasted to active window")
-                self._set_status("Done")
-                self._hide_popup()
+        if self.ui_cancel_transcription_btn is not None:
+            if self.is_transcribing:
+                self.ui_cancel_transcription_btn.state(["!disabled"])
             else:
-                logging.warning("Transcription returned empty text")
-                self._set_status("Empty transcription")
-                self._show_popup("EMPTY TRANSCRIPTION", bg="#7d5a11")
-        except Exception as exc:
-            if self.config.vad_filter and "silero_vad_v6.onnx" in str(exc):
-                try:
-                    logging.warning("VAD asset missing, retrying without VAD")
-                    segments, info = self.model.transcribe(
-                        str(audio_path),
-                        beam_size=self.config.beam_size,
-                        vad_filter=False,
-                    )
-                    text = "".join(segment.text for segment in segments).strip()
-                    if text:
-                        self._paste_text(text)
-                        logging.info("Text pasted to active window")
-                        self._set_status("Done (without VAD)")
-                        self._hide_popup()
-                    else:
-                        self._set_status("Empty transcription")
-                        self._show_popup("EMPTY TRANSCRIPTION", bg="#7d5a11")
-                except Exception:
-                    logging.exception("Transcription failed")
-                    self._set_status("Transcription failed")
-                    self._show_popup("TRANSCRIPTION FAILED", bg="#9a1b1b")
+                self.ui_cancel_transcription_btn.state(["disabled"])
+
+        if self.ui_repeat_paste_btn is not None:
+            if self.last_pasted_text and allow_recovery_actions:
+                self.ui_repeat_paste_btn.state(["!disabled"])
             else:
-                logging.exception("Transcription failed")
-                self._set_status("Transcription failed")
-                self._show_popup("TRANSCRIPTION FAILED", bg="#9a1b1b")
-        finally:
-            self.is_transcribing = False
+                self.ui_repeat_paste_btn.state(["disabled"])
 
-    def _paste_text(self, text: str) -> None:
-        previous_clipboard = None
-        try:
-            previous_clipboard = pyperclip.paste()
-        except Exception:
-            logging.warning("Could not read clipboard")
-
-        pyperclip.copy(text)
-        time.sleep(max(0.25, self.config.paste_delay_sec))
-
-        if self.target_hwnd is None:
-            self.target_hwnd = self._get_foreground_window()
-
-        self._activate_window(self.target_hwnd)
-        time.sleep(max(0.3, self.config.paste_delay_sec))
-        self._release_modifiers()
-        time.sleep(0.08)
-
-        self._send_wm_paste(self.target_hwnd)
-        time.sleep(max(0.12, self.config.paste_delay_sec))
-        self._send_shortcut_vk(0x11, 0x56)
-        time.sleep(max(0.12, self.config.paste_delay_sec))
-        self._send_shortcut_vk(0x10, 0x2D)
-
-        if self.config.restore_clipboard and previous_clipboard is not None:
-            try:
-                time.sleep(max(0.6, self.config.paste_delay_sec))
-                pyperclip.copy(previous_clipboard)
-            except Exception:
-                logging.warning("Could not restore clipboard")
+        if self.ui_undo_paste_btn is not None:
+            if self.last_paste_can_undo and allow_recovery_actions:
+                self.ui_undo_paste_btn.state(["!disabled"])
+            else:
+                self.ui_undo_paste_btn.state(["disabled"])
 
     def _set_status(self, text: str) -> None:
         if self.ui_status_var is not None:
@@ -741,13 +585,53 @@ class LocalSTTApp:
                 _cancel_timer()
                 self.ui_toast_window.withdraw()
 
+    def _update_recording_popup_timer(self) -> None:
+        if self.ui_toast_window is None or self.ui_toast_label is None:
+            return
+        if not self.is_recording or self.recording_started_at is None:
+            return
+        elapsed_sec = max(0, int(time.perf_counter() - self.recording_started_at))
+        minutes = elapsed_sec // 60
+        seconds = elapsed_sec % 60
+        self.ui_toast_label.configure(text=f"RECORDING... {minutes:02d}:{seconds:02d}")
+
     def _mic_test_callback(self, indata: np.ndarray, frames: int, callback_time, status) -> None:
         if status:
             logging.warning("Mic test status: %s", status)
         try:
             data = indata.astype(np.float32)
-            rms = float(np.sqrt(np.mean(np.square(data))))
-            self.mic_level = min(100.0, max(0.0, rms / 327.68))
+            if data.size == 0:
+                self.mic_level = 0.0
+                return
+
+            sample_dtype = np.dtype(self.config.dtype)
+            if np.issubdtype(sample_dtype, np.integer):
+                info = np.iinfo(sample_dtype)
+                scale = float(max(abs(info.min), info.max))
+            else:
+                scale = 1.0
+
+            if scale <= 0:
+                self.mic_level = 0.0
+                return
+
+            normalized = np.clip(data / scale, -1.0, 1.0)
+            rms = float(np.sqrt(np.mean(np.square(normalized))))
+            peak = float(np.max(np.abs(normalized)))
+
+            floor_db = -55.0
+            rms_db = 20.0 * float(np.log10(max(rms, 1e-6)))
+            peak_db = 20.0 * float(np.log10(max(peak, 1e-6)))
+
+            rms_level = ((rms_db - floor_db) / abs(floor_db)) * 100.0
+            peak_level = ((peak_db - floor_db) / abs(floor_db)) * 100.0
+            instant_level = max(rms_level * 0.65, peak_level)
+            instant_level = min(100.0, max(0.0, instant_level))
+
+            if instant_level >= self.mic_level:
+                self.mic_level = (self.mic_level * 0.35) + (instant_level * 0.65)
+            else:
+                self.mic_level = (self.mic_level * 0.82) + (instant_level * 0.18)
         except Exception:
             self.mic_level = 0.0
 
@@ -842,8 +726,49 @@ class LocalSTTApp:
             self.ui_mic_level_var.set(self.mic_level)
 
         self._process_popup_queue()
+        self._update_recording_popup_timer()
+        self._update_recovery_buttons()
 
         self.ui_root.after(100, self._ui_poll)
+
+    def _configure_ui_styles(self, root) -> None:
+        from tkinter import ttk
+
+        style = ttk.Style(root)
+        default_bg = style.lookup("TFrame", "background") or root.cget("bg")
+
+        style.configure("AppShell.TFrame", background=default_bg)
+        style.configure(
+            "App.TNotebook",
+            background=default_bg,
+            borderwidth=1,
+            tabmargins=(2, 2, 2, 0),
+        )
+        style.configure(
+            "App.TNotebook.Tab",
+            padding=(10, 4),
+            borderwidth=1,
+            relief="flat",
+            font=("Segoe UI", 9),
+        )
+        style.map(
+            "App.TNotebook.Tab",
+            background=[
+                ("selected", "#ffffff"),
+                ("active", "#f5f5f5"),
+            ],
+            foreground=[
+                ("selected", "#1f1f1f"),
+                ("active", "#1f1f1f"),
+            ],
+            expand=[("selected", [0, 0, 0, 0])],
+        )
+        style.configure(
+            "TabBody.TFrame",
+            background="#ffffff",
+            borderwidth=1,
+            relief="solid",
+        )
 
     def _build_ui(self) -> None:
         import tkinter as tk
@@ -853,8 +778,8 @@ class LocalSTTApp:
         self.ui_root = root
         root.title("LocalSTT")
 
-        width = 450
-        height = 600
+        width = 500
+        height = 720
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
         margin_right = 24
@@ -863,8 +788,9 @@ class LocalSTTApp:
         y = max(0, (screen_h - height) // 2)
 
         root.geometry(f"{width}x{height}+{x}+{y}")
-        root.minsize(450, 600)
-        root.maxsize(450, 600)
+        root.minsize(width, height)
+        root.maxsize(width, height)
+        self._configure_ui_styles(root)
 
         icon_path = self._resolve_icon_path()
         if icon_path is not None:
@@ -901,23 +827,47 @@ class LocalSTTApp:
         self.ui_toast_window = toast
         self.ui_toast_label = toast_label
 
-        container = ttk.Frame(root, padding=6)
+        container = ttk.Frame(root, padding=8, style="AppShell.TFrame")
         container.pack(fill="both", expand=True)
 
-        notebook = ttk.Notebook(container)
-        notebook.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(container, style="App.TNotebook")
+        notebook.pack(fill="both", expand=True, pady=(2, 0))
         self.ui_tabs = notebook
 
-        tab_mic = ttk.Frame(notebook)
-        tab_desc = ttk.Frame(notebook)
-        tab_logs = ttk.Frame(notebook)
+        tab_mic = ttk.Frame(notebook, style="TabBody.TFrame")
+        tab_desc = ttk.Frame(notebook, style="TabBody.TFrame")
+        tab_logs = ttk.Frame(notebook, style="TabBody.TFrame")
+        tab_history = ttk.Frame(notebook, style="TabBody.TFrame")
         notebook.add(tab_mic, text="Microphone")
         notebook.add(tab_desc, text="Description")
         notebook.add(tab_logs, text="Logs")
+        notebook.add(tab_history, text="History")
 
         log_text = tk.Text(tab_logs, wrap="word", font=("Consolas", 8), state="disabled")
         log_text.pack(fill="both", expand=True, padx=6, pady=6)
         self.ui_log_text = log_text
+
+        history_frame = ttk.Frame(tab_history, padding=6)
+        history_frame.pack(fill="both", expand=True)
+
+        ttk.Label(history_frame, text="Last 10 transcriptions").pack(anchor="w", pady=(0, 6))
+
+        history_text_frame = ttk.Frame(history_frame)
+        history_text_frame.pack(fill="both", expand=True)
+
+        history_scrollbar = ttk.Scrollbar(history_text_frame, orient="vertical")
+        history_scrollbar.pack(side="right", fill="y")
+
+        history_text = tk.Text(
+            history_text_frame,
+            wrap="word",
+            font=("Segoe UI", 9),
+            state="disabled",
+            yscrollcommand=history_scrollbar.set,
+        )
+        history_text.pack(side="left", fill="both", expand=True)
+        history_scrollbar.configure(command=history_text.yview)
+        self.ui_history_text = history_text
 
         desc = tk.Text(tab_desc, wrap="word", font=("Segoe UI", 9))
         desc.pack(fill="both", expand=True, padx=6, pady=6)
@@ -928,11 +878,16 @@ class LocalSTTApp:
             "Ctrl+Shift+Q - start/stop recording\n"
             "Ctrl+Shift+W - transcribe last recording\n"
             "Ctrl+Shift+E - exit\n\n"
+            "Russian keyboard layout is also supported: Й / Ц / У.\n\n"
+            "Default mode transcribes the whole recorded WAV after stop.\n"
+            "An experimental live-overlap mode is still available through config if you want to compare it later.\n\n"
+            "Set a preferred transcription language in settings to avoid language guessing.\n\n"
             "How it works:\n"
             "1) Start recording with a hotkey.\n"
-            "2) After stop, audio is sent to faster-whisper.\n"
+            "2) In stable mode, after stop the full WAV is sent to faster-whisper.\n"
             "3) Recognized text is pasted into the active window.\n\n"
-            "The Logs tab shows progress in real time."
+            "The Logs tab shows progress in real time.\n"
+            "The History tab keeps the last 10 transcription results."
         )
         desc.configure(state="disabled")
 
@@ -959,10 +914,35 @@ class LocalSTTApp:
 
         self.ui_vad_var = tk.BooleanVar(value=self.config.vad_filter)
         self.ui_restore_clipboard_var = tk.BooleanVar(value=self.config.restore_clipboard)
+        self.ui_language_var = tk.StringVar(value=_language_display_value(self.config.transcription_language))
+
+        ttk.Label(mic_frame, text="Preferred transcription language:").pack(anchor="w", pady=(8, 2))
+        language_combo = ttk.Combobox(
+            mic_frame,
+            textvariable=self.ui_language_var,
+            values=[label for label, _code in COMMON_LANGUAGE_OPTIONS],
+        )
+        language_combo.pack(fill="x")
+        self.ui_language_combo = language_combo
+        ttk.Label(
+            mic_frame,
+            text="Use Auto detect or type a Whisper language code such as en, ru, es.",
+        ).pack(anchor="w", pady=(2, 6))
 
         def _apply_simple_settings() -> None:
+            selected_language = _normalize_transcription_language(
+                self.ui_language_var.get() if self.ui_language_var is not None else self.config.transcription_language,
+                fallback="",
+            )
+            if not selected_language:
+                self._set_status("Unsupported language code")
+                self._show_popup("UNSUPPORTED LANGUAGE CODE", bg="#9a1b1b")
+                return
             self.config.vad_filter = bool(self.ui_vad_var.get())
             self.config.restore_clipboard = bool(self.ui_restore_clipboard_var.get())
+            self.config.transcription_language = selected_language
+            if self.ui_language_var is not None:
+                self.ui_language_var.set(_language_display_value(selected_language))
             self._save_settings_to_file()
             self._set_status("Settings saved")
 
@@ -974,10 +954,44 @@ class LocalSTTApp:
         ).pack(anchor="w")
         ttk.Button(mic_frame, text="Save settings", command=_apply_simple_settings).pack(fill="x", pady=(6, 0))
 
+        recovery_frame = ttk.LabelFrame(container, text="Recovery actions", padding=6)
+        recovery_frame.pack(fill="x", pady=(6, 0))
+
+        ttk.Label(
+            recovery_frame,
+            text="Cancel the active job or recover the last paste safely.",
+        ).pack(anchor="w", pady=(0, 6))
+
+        cancel_btn = ttk.Button(
+            recovery_frame,
+            text="Cancel processing",
+            command=lambda: self._dispatch_ui_action("cancel_transcription", self.cancel_transcription),
+        )
+        cancel_btn.pack(fill="x")
+        self.ui_cancel_transcription_btn = cancel_btn
+
+        repeat_btn = ttk.Button(
+            recovery_frame,
+            text="Re-paste last text",
+            command=lambda: self._dispatch_ui_action("repeat_last_paste", self.repeat_last_paste),
+        )
+        repeat_btn.pack(fill="x", pady=(6, 0))
+        self.ui_repeat_paste_btn = repeat_btn
+
+        undo_btn = ttk.Button(
+            recovery_frame,
+            text="Undo last paste",
+            command=lambda: self._dispatch_ui_action("undo_last_paste", self.undo_last_paste),
+        )
+        undo_btn.pack(fill="x", pady=(6, 0))
+        self.ui_undo_paste_btn = undo_btn
+
         self.ui_status_var = tk.StringVar(value="Done")
         ttk.Label(container, textvariable=self.ui_status_var).pack(fill="x", pady=(6, 0))
 
         self._refresh_mic_devices()
+        self._refresh_history_view()
+        self._update_recovery_buttons()
         notebook.select(tab_logs)
 
         def _on_close() -> None:
@@ -1017,7 +1031,7 @@ class LocalSTTApp:
 
     def run(self) -> None:
         logging.info("LocalSTT started")
-        logging.info("Hotkeys: Ctrl+Shift+Q/W/E")
+        logging.info("Hotkeys: Ctrl+Shift+Q/W/E and Ctrl+Shift+Й/Ц/У")
         self.hotkeys.start()
         self._build_ui()
         logging.info("LocalSTT stopped")
@@ -1030,6 +1044,21 @@ def main() -> None:
     restore_clipboard_flag = os.environ.get("LOCALSTT_RESTORE_CLIPBOARD", "1").strip().lower()
     restore_clipboard = restore_clipboard_flag in {"1", "true", "yes", "on"}
 
+    chunk_duration_raw = os.environ.get("LOCALSTT_CHUNK_SEC", "2.0")
+    try:
+        chunk_duration = max(0.25, float(chunk_duration_raw))
+    except ValueError:
+        chunk_duration = 2.0
+
+    chunk_overlap_raw = os.environ.get("LOCALSTT_CHUNK_OVERLAP_SEC", "0.5")
+    try:
+        chunk_overlap = max(0.0, float(chunk_overlap_raw))
+    except ValueError:
+        chunk_overlap = 0.5
+
+    transcription_language = _normalize_transcription_language(os.environ.get("LOCALSTT_LANGUAGE", "auto"))
+    transcription_mode = _normalize_transcription_mode(os.environ.get("LOCALSTT_MODE", "full-file"))
+
     config = AppConfig(
         model_size=os.environ.get("LOCALSTT_MODEL", "small"),
         model_path=os.environ.get("LOCALSTT_MODEL_PATH", "models/faster-whisper-small"),
@@ -1038,6 +1067,10 @@ def main() -> None:
         device=os.environ.get("LOCALSTT_DEVICE", "auto"),
         restore_clipboard=restore_clipboard,
         input_device=os.environ.get("LOCALSTT_INPUT_DEVICE"),
+        transcription_mode=transcription_mode,
+        chunk_duration_sec=chunk_duration,
+        chunk_overlap_sec=chunk_overlap,
+        transcription_language=transcription_language,
     )
 
     if "LOCALSTT_MODEL_PATH" not in os.environ:

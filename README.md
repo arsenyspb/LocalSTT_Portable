@@ -17,7 +17,11 @@ Lightweight and reliable daily dictation tool for Windows.
 
 - Voice recording with a global hotkey
 - Recording transcription using OpenAI Whisper models via faster-whisper
+- Default stable mode: after recording stops, the whole WAV file is transcribed in one pass
+- Experimental mode is still available: near-real-time overlapping chunks during recording for comparison/debugging
+- Preferred transcription language can be forced in settings to avoid wrong auto-detection
 - Text insertion into the active window
+- Recovery actions in the app window: cancel processing, re-paste the last text, and undo the last paste
 - Offline mode by default
 
 ## Input and Cursor Behavior
@@ -63,6 +67,7 @@ Tabs:
 - Microphone
 - Description
 - Logs (default)
+- History
 
 ### Microphone Tab
 
@@ -73,6 +78,7 @@ Tabs:
 - Basic settings:
   - VAD filter
   - Restore clipboard
+  - Preferred transcription language
 
 ### Description Tab
 
@@ -81,6 +87,10 @@ Brief information about how the app works and which hotkeys are available.
 ### Logs Tab
 
 Real-time logs in a compact font.
+
+### History Tab
+
+Shows the last 10 transcription results as stacked text blocks in a scrollable view, including timestamp, language, length, and the full transcription text.
 
 ## Application Icon
 
@@ -101,6 +111,13 @@ pip install -r requirements.txt
 ```powershell
 python src/main.py
 ```
+
+Optional environment variable:
+
+- `LOCALSTT_MODE` - transcription mode: `full-file` (default) or `live-overlap` (experimental)
+- `LOCALSTT_CHUNK_SEC` - chunk duration in seconds for the experimental `live-overlap` mode (default: `2.0`)
+- `LOCALSTT_CHUNK_OVERLAP_SEC` - overlap between consecutive chunks in the experimental `live-overlap` mode (default: `0.5`)
+- `LOCALSTT_LANGUAGE` - preferred Whisper language code, for example `en`, `ru`, `es`, or `auto`
 
 ## Portable Build
 
@@ -142,6 +159,20 @@ Why ZIP is recommended:
 - Faster startup than the one-file EXE.
 - Fewer antivirus false positives.
 - No installation required.
+
+## ZIP + EXE Build
+
+Build both release artifacts in one run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_release_bundle.ps1
+```
+
+Output:
+- dist/LocalSTT-Portable.zip
+- dist/LocalSTT-OneFile.exe
+
+Use this when you want to publish both the portable ZIP and the one-file EXE together.
 
 The legacy-compatible script also works:
 
