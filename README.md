@@ -115,7 +115,7 @@ Output:
 
 Important:
 - Start LocalSTT.exe specifically from the dist/LocalSTT folder
-- Do not move only the EXE file by itself; the full dist/LocalSTT folder is required
+- Do not move only the EXE file by itself; it must stay next to the `_internal` folder inside the full dist/LocalSTT directory
 
 ## Recommended Release Package (ZIP)
 
@@ -133,6 +133,10 @@ Recommended end-user flow:
 2. Extract the ZIP to any folder.
 3. Open the extracted `LocalSTT` folder.
 4. Run `LocalSTT.exe`.
+
+Important:
+- Do not move `LocalSTT.exe` out of the extracted `LocalSTT` folder.
+- `LocalSTT.exe` requires the `_internal` folder next to it.
 
 Why ZIP is recommended:
 - Faster startup than the one-file EXE.
