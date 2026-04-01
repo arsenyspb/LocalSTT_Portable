@@ -7,12 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased] - 2026-04-01
 
 ### Added
+- **Floating Recording HUD:** Implemented a high-visibility, "Always-on-Top" red floating status box that appears during recording. It includes a "● REC" indicator and a real-time timer.
 - **Native Dual-Target Architecture:** Introduced `src/os_adapter.py` providing an `OSAdapter` interface to handle platform-specific UI interactions (window focus, paste, undo).
 - **macOS Support:** Implemented `MacAdapter` using native `osascript` (AppleScript) for reliable window targeting and simulated keystrokes.
 - **macOS Build Script:** Added `scripts/build_macos.sh` to compile the application into a `.app` bundle using PyInstaller.
 - **Architecture & Contributing Docs:** Added `ARCHITECTURE.md` and `CONTRIBUTING.md` to establish guidelines for the new cross-platform direction.
 
 ### Changed
+- **Focus Preservation:** Refactored the notification system to ensure the main application window remains in the background when starting a recording via hotkey. The HUD now uses non-focus-stealing topmost attributes.
 - **Hotkey System:** Migrated from a custom key listener to `pynput.keyboard.GlobalHotKeys` for better cross-platform reliability and safety. 
   - Windows bindings remain `Ctrl + Alt + Q/W/E`.
   - macOS bindings map to `Ctrl + Option + Q/W/E` (including Quartz virtual key codes for alternate keyboard layouts).

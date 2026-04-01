@@ -506,13 +506,15 @@ class LocalSTTApp(LocalSTTCore):
             if action == "show":
                 _cancel_timer()
                 text = str(payload.get("text", ""))
-                bg = str(payload.get("bg", "#1e6b2d"))
+                bg = str(payload.get("bg", "#9a1b1b"))
                 persistent = bool(payload.get("persistent", False))
 
                 self.ui_toast_label.configure(text=text, bg=bg)
                 self.ui_toast_window.configure(bg=bg)
                 self.ui_toast_window.deiconify()
-                self.ui_toast_window.lift()
+                # On Mac, deiconify sometimes brings the root window to front.
+                # We use topmost to stay above without focus force.
+                self.ui_toast_window.attributes("-topmost", True)
 
                 if not persistent:
                     timeout_ms = int(self.config.popup_duration_sec * 1000)
@@ -536,7 +538,8 @@ class LocalSTTApp(LocalSTTCore):
         elapsed_sec = max(0, int(time.perf_counter() - self.recording_started_at))
         minutes = elapsed_sec // 60
         seconds = elapsed_sec % 60
-        self.ui_toast_label.configure(text=f"RECORDING... {minutes:02d}:{seconds:02d}")
+        # Use a high-visibility Unicode red circle
+        self.ui_toast_label.configure(text=f"● REC {minutes:02d}:{seconds:02d}")
 
     def _mic_test_callback(self, indata: np.ndarray, frames: int, callback_time, status) -> None:
         if status:
@@ -768,21 +771,25 @@ class LocalSTTApp(LocalSTTCore):
         toast = tk.Toplevel(root)
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
+        if sys.platform == "darwin":
+            # On macOS, ensure the toast is visible over other apps without stealing focus
+            toast.bind("<Map>", lambda e: toast.attributes("-topmost", True))
+
         toast.withdraw()
 
-        toast_w = 280
-        toast_h = 42
+        toast_w = 320
+        toast_h = 44
         toast_x = max(0, (screen_w - toast_w) // 2)
-        toast_y = 40
+        toast_y = 50
         toast.geometry(f"{toast_w}x{toast_h}+{toast_x}+{toast_y}")
 
         toast_label = tk.Label(
             toast,
             text="",
-            bg="#1e6b2d",
+            bg="#9a1b1b",
             fg="white",
-            font=("Segoe UI", 10, "bold"),
-            padx=10,
+            font=("Segoe UI", 11, "bold"),
+            padx=12,
             pady=8,
         )
         toast_label.pack(fill="both", expand=True)
