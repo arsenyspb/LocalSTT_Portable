@@ -18,6 +18,7 @@ from pynput import keyboard
 from pynput.keyboard import Controller
 
 from app_core import LocalSTTCore
+from os_adapter import get_os_adapter
 
 
 CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
@@ -141,6 +142,9 @@ class LocalSTTApp(LocalSTTCore):
         else:
             self.project_root = Path(__file__).resolve().parent.parent
 
+        self.keyboard_controller = Controller()
+        self.os_adapter = get_os_adapter(self.keyboard_controller)
+
         local_app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LocalSTT"
         self.recordings_dir = local_app_data / "recordings"
         self.logs_dir = local_app_data / "logs"
@@ -167,7 +171,6 @@ class LocalSTTApp(LocalSTTCore):
         self.mic_level: float = 0.0
 
         self.last_audio_file: Path | None = None
-        self.keyboard_controller = Controller()
         self.target_hwnd: int | None = None
         self.target_focus_hwnd: int | None = None
         self.action_lock = threading.Lock()
