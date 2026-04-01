@@ -20,9 +20,11 @@ from pynput.keyboard import Controller
 from app_core import LocalSTTCore
 from os_adapter import get_os_adapter
 
+if sys.platform == "darwin":
+    HOTKEY_PREFIX = "Ctrl+Option"
+else:
+    HOTKEY_PREFIX = "Ctrl+Alt"
 
-CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
-SHIFT_KEYS = {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}
 COMMON_LANGUAGE_OPTIONS: list[tuple[str, str]] = [
     ("Auto detect", "auto"),
     ("English (en)", "en"),
@@ -180,8 +182,6 @@ class LocalSTTApp(LocalSTTCore):
         self.last_paste_target_hwnd: int | None = None
         self.last_paste_target_focus_hwnd: int | None = None
         self.last_paste_can_undo = False
-        self.hotkey_ctrl_pressed = False
-        self.hotkey_shift_pressed = False
         self.active_hotkey_names: set[str] = set()
         self.recording_audio_lock = threading.Lock()
         self.recording_audio_event = threading.Event()
@@ -235,98 +235,27 @@ class LocalSTTApp(LocalSTTCore):
         self.input_device = self._resolve_input_device(self.config.input_device)
         self._log_audio_input_info()
 
-        self.hotkey_actions_by_vk: dict[int, tuple[str, Any]] = {
-            0x51: ("toggle_recording", self.toggle_recording),
-            0x57: ("transcribe_last", self.transcribe_last_file),
-            0x45: ("shutdown", self.shutdown),
-        }
-        self.hotkey_actions_by_char: dict[str, tuple[str, Any]] = {
-            "q": ("toggle_recording", self.toggle_recording),
-            "w": ("transcribe_last", self.transcribe_last_file),
-            "e": ("shutdown", self.shutdown),
-            "й": ("toggle_recording", self.toggle_recording),
-            "ц": ("transcribe_last", self.transcribe_last_file),
-            "у": ("shutdown", self.shutdown),
+        def wrap_action(name, action):
+            return lambda: self._dispatch_hotkey(name, action)
+
+        hotkey_dict = {
+            '<ctrl>+<alt>+q': wrap_action("toggle_recording", self.toggle_recording),
+            '<ctrl>+<alt>+w': wrap_action("transcribe_last", self.transcribe_last_file),
+            '<ctrl>+<alt>+e': wrap_action("shutdown", self.shutdown),
+            '<ctrl>+<alt>+й': wrap_action("toggle_recording", self.toggle_recording),
+            '<ctrl>+<alt>+ц': wrap_action("transcribe_last", self.transcribe_last_file),
+            '<ctrl>+<alt>+у': wrap_action("shutdown", self.shutdown),
         }
 
-        self.hotkeys = keyboard.Listener(
-            on_press=self._on_hotkey_press,
-            on_release=self._on_hotkey_release,
-        )
+        # On Mac, also map the Quartz VK codes directly in case 'char' evaluation fails
+        if sys.platform == "darwin":
+            hotkey_dict.update({
+                '<ctrl>+<alt>+<12>': wrap_action("toggle_recording", self.toggle_recording),
+                '<ctrl>+<alt>+<13>': wrap_action("transcribe_last", self.transcribe_last_file),
+                '<ctrl>+<alt>+<14>': wrap_action("shutdown", self.shutdown),
+            })
 
-    def _key_vk(self, key) -> int | None:
-        try:
-            vk = getattr(key, "vk", None)
-            if vk is None:
-                return None
-            return int(vk)
-        except Exception:
-            return None
-
-    def _key_char(self, key) -> str | None:
-        try:
-            char = getattr(key, "char", None)
-            if char is None:
-                return None
-            return str(char).lower()
-        except Exception:
-            return None
-
-    def _resolve_hotkey_action(self, key) -> tuple[str, Any] | None:
-        vk = self._key_vk(key)
-        if vk is not None and vk in self.hotkey_actions_by_vk:
-            return self.hotkey_actions_by_vk[vk]
-
-        char = self._key_char(key)
-        if char is not None and char in self.hotkey_actions_by_char:
-            return self.hotkey_actions_by_char[char]
-
-        return None
-
-    def _on_hotkey_press(self, key) -> None:
-        try:
-            if key in CTRL_KEYS:
-                self.hotkey_ctrl_pressed = True
-                return
-            if key in SHIFT_KEYS:
-                self.hotkey_shift_pressed = True
-                return
-
-            if not (self.hotkey_ctrl_pressed and self.hotkey_shift_pressed):
-                return
-
-            resolved = self._resolve_hotkey_action(key)
-            if resolved is None:
-                return
-
-            hotkey_name, action = resolved
-            if hotkey_name in self.active_hotkey_names:
-                return
-
-            self.active_hotkey_names.add(hotkey_name)
-            self._dispatch_hotkey(hotkey_name, action)
-        except Exception:
-            logging.exception("Hotkey press handler failed")
-
-    def _on_hotkey_release(self, key) -> None:
-        try:
-            if key in CTRL_KEYS:
-                self.hotkey_ctrl_pressed = False
-                self.active_hotkey_names.clear()
-                return
-            if key in SHIFT_KEYS:
-                self.hotkey_shift_pressed = False
-                self.active_hotkey_names.clear()
-                return
-
-            resolved = self._resolve_hotkey_action(key)
-            if resolved is None:
-                return
-
-            hotkey_name, _action = resolved
-            self.active_hotkey_names.discard(hotkey_name)
-        except Exception:
-            logging.exception("Hotkey release handler failed")
+        self.hotkeys = keyboard.GlobalHotKeys(hotkey_dict)
 
     def _resolve_icon_path(self) -> Path | None:
         candidates = [
@@ -646,6 +575,13 @@ class LocalSTTApp(LocalSTTCore):
             if device is None:
                 self._set_status("No microphone available")
                 return
+                
+            import sounddevice as sd
+            info = sd.query_devices(device)
+            if int(info.get("max_input_channels", 0)) == 0:
+                self._set_status(f"Selected device '{info.get('name', 'Unknown')}' has no input channels")
+                return
+                
             self.mic_monitor_stream = sd.InputStream(
                 samplerate=self.config.sample_rate,
                 channels=self.config.channels,
@@ -655,8 +591,8 @@ class LocalSTTApp(LocalSTTCore):
             )
             self.mic_monitor_stream.start()
             self._set_status("Microphone test enabled")
-        except Exception:
-            logging.exception("Failed to start mic test")
+        except Exception as e:
+            logging.error(f"Failed to start mic test: {e}")
             self._set_status("Failed to start microphone test")
             self.mic_monitor_stream = None
 
@@ -698,6 +634,19 @@ class LocalSTTApp(LocalSTTCore):
     def _refresh_mic_devices(self) -> None:
         if self.ui_mic_combo is None:
             return
+
+        # Stop mic test if it's currently running, as PortAudio won't restart with active streams
+        if getattr(self, "mic_monitor_stream", None) is not None:
+            self._toggle_mic_test()
+
+        # Attempt to restart PortAudio to detect newly connected devices (e.g., AirPods on macOS)
+        try:
+            import sounddevice as sd
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            logging.warning(f"Failed to refresh PortAudio devices: {e}")
+
         items = [f"{idx}: {name}" for idx, name in self._input_devices_list()]
         self.ui_mic_combo["values"] = items
 
@@ -878,9 +827,9 @@ class LocalSTTApp(LocalSTTCore):
             "1.0",
             "LocalSTT portable\n\n"
             "Hotkeys:\n"
-            "Ctrl+Shift+Q - start/stop recording\n"
-            "Ctrl+Shift+W - transcribe last recording\n"
-            "Ctrl+Shift+E - exit\n\n"
+            f"{HOTKEY_PREFIX}+Q - start/stop recording\n"
+            f"{HOTKEY_PREFIX}+W - transcribe last recording\n"
+            f"{HOTKEY_PREFIX}+E - exit\n\n"
             "Russian keyboard layout is also supported: Й / Ц / У.\n\n"
             "Default mode transcribes the whole recorded WAV after stop.\n"
             "An experimental live-overlap mode is still available through config if you want to compare it later.\n\n"
@@ -1034,7 +983,7 @@ class LocalSTTApp(LocalSTTCore):
 
     def run(self) -> None:
         logging.info("LocalSTT started")
-        logging.info("Hotkeys: Ctrl+Shift+Q/W/E and Ctrl+Shift+Й/Ц/У")
+        logging.info(f"Hotkeys: {HOTKEY_PREFIX}+Q/W/E and {HOTKEY_PREFIX}+Й/Ц/У")
         self.hotkeys.start()
         self._build_ui()
         logging.info("LocalSTT stopped")

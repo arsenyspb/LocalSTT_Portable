@@ -404,7 +404,14 @@ class LocalSTTCore:
             if effective is None:
                 logging.error("No input microphone device found")
                 return
-            info = sd.query_devices(effective, "input")
+            info = sd.query_devices(effective)
+            # Make sure it actually has input channels, otherwise it's an output device
+            if int(info.get("max_input_channels", 0)) == 0:
+                logging.warning(f"Device '{info.get('name', effective)}' has 0 input channels. Falling back to default.")
+                self.config.input_device = None
+                effective = self._get_effective_input_device()
+                info = sd.query_devices(effective) if effective is not None else {}
+                
             logging.info("Using microphone: %s", info.get("name", effective))
         except Exception:
             logging.exception("Could not resolve input device")
