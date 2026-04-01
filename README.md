@@ -14,6 +14,8 @@ Lightweight and reliable daily dictation tool for Windows and macOS.
 - No installation for end users: download a ZIP/DMG from GitHub Releases, extract it, and run.
 - Works in any app that accepts paste/input.
 
+Please see the [CHANGELOG.md](CHANGELOG.md) for details on the latest updates, architectural changes, and cross-platform developments.
+
 ## What It Does
 
 - Voice recording with a global hotkey.
