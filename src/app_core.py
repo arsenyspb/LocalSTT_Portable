@@ -996,11 +996,22 @@ class LocalSTTCore:
         except Exception:
             logging.warning("Could not read clipboard")
 
-        pyperclip.copy(text)
-        time.sleep(max(0.25, self.config.paste_delay_sec))
-
         if self.target_hwnd is None:
             self.target_hwnd = self._get_foreground_window()
+
+        is_app_target = False
+        if self.target_hwnd is not None:
+            if self._get_window_pid(self.target_hwnd) == os.getpid():
+                is_app_target = True
+
+        if is_app_target:
+            logging.info("Target window is the application itself. Text copied to clipboard only.")
+            pyperclip.copy(text)
+            self._set_status("Text copied to clipboard")
+            return
+
+        pyperclip.copy(text)
+        time.sleep(max(0.25, self.config.paste_delay_sec))
 
         # Target focus should be captured before starting recording or during _capture_target_window
         self.os_adapter.send_paste(self.target_hwnd)

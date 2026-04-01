@@ -17,6 +17,17 @@ from faster_whisper import WhisperModel
 from pynput import keyboard
 from pynput.keyboard import Controller
 
+# --- WORKAROUND for macOS Accelerate (NumPy 2.0+) float16 bug ---
+if sys.platform == "darwin":
+    import faster_whisper.feature_extractor
+    _orig_init = faster_whisper.feature_extractor.FeatureExtractor.__init__
+    def _patched_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        if hasattr(self, "mel_filters"):
+            self.mel_filters = self.mel_filters.astype(np.float32)
+    faster_whisper.feature_extractor.FeatureExtractor.__init__ = _patched_init
+# ---------------------------------------------------------------
+
 from app_core import LocalSTTCore
 from os_adapter import get_os_adapter
 
